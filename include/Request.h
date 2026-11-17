@@ -15,6 +15,7 @@ protected:
     std::vector<std::string> tokens;
     std::vector<std::size_t> memoryBlocks;
     std::size_t reservedBlocks;
+    
 public:
     Request(int id, const Model& model, int admissionCycle, std::string prompt); //splits the prompt into tokens
     virtual std::size_t getNeededMemory(const GPU& gpu) const=0; //
@@ -51,9 +52,11 @@ public:
     virtual void reserveMemory(GPU& gpu) override;
     virtual std::string getOutput() const override;
     virtual std::size_t getNeedToUnreserve() const override;
-
+};
 
 class EmbeddingRequest: public Request{
+private:
+    std::string finalOutput;
 public:
     EmbeddingRequest(int id, const Model& model, int admissionCycle, std::string prompt); //the constructor of EmbeddingRequest.
     virtual std::size_t getNeededMemory(const GPU& gpu) const override; 
