@@ -18,6 +18,7 @@ protected:
     
 public:
     Request(int id, const Model& model, int admissionCycle, std::string prompt); //splits the prompt into tokens
+    virtual ~Request(); // virtual destructor for polymorphic deletion via base pointer 
     virtual std::size_t getNeededMemory(const GPU& gpu) const=0; //
     virtual std::size_t getMaxNeededMemory() const=0; 
     virtual std::vector<std::string> getCacheableTokens() const=0; 
@@ -38,8 +39,10 @@ class GenerativeRequest: public Request{
 private:
     std::string scriptedOutput;
     std::vector<std::string> scriptedOutputTokens;
-    std::size_t maxOutputTokens;
     std::vector<std::string> generatedTokens;
+    std::size_t maxOutputTokens;
+    std::size_t processedTokens;
+    std::size_t allocatedBlocks;
 public:
     GenerativeRequest(int id, const Model& model, int admissionCycle, std::string prompt, std::string scriptedOutput,
     std::size_t maxOutputTokens); // the constructor of GenerativeRequest, which also receives the scripted output and the maximal number of tokens to generate.
@@ -59,6 +62,7 @@ public:
 class EmbeddingRequest: public Request{
 private:
     std::string finalOutput;
+    std::size_t processedTokensCount;
 public:
     EmbeddingRequest(int id, const Model& model, int admissionCycle, std::string prompt); //the constructor of EmbeddingRequest.
     virtual std::size_t getNeededMemory(const GPU& gpu) const override; 
