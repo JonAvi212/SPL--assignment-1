@@ -37,7 +37,9 @@ public:
 class GenerativeRequest: public Request{
 private:
     std::string scriptedOutput;
+    std::vector<std::string> scriptedOutputTokens;
     std::size_t maxOutputTokens;
+    std::vector<std::string> generatedTokens;
 public:
     GenerativeRequest(int id, const Model& model, int admissionCycle, std::string prompt, std::string scriptedOutput,
     std::size_t maxOutputTokens); // the constructor of GenerativeRequest, which also receives the scripted output and the maximal number of tokens to generate.

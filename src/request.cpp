@@ -37,7 +37,7 @@ void Request::deallocateMemory(GPU& gpu){
 
 GenerativeRequest::GenerativeRequest(int id, const Model& model, int admissionCycle, std::string prompt, std::string scriptedOutput,
 std::size_t maxOutputTokens):
-    Request(id, model, admissionCycle, prompt), scriptedOutput(scriptedOutput), maxOutputTokens(maxOutputTokens) {
+    Request(id, model, admissionCycle, prompt), scriptedOutput(scriptedOutput), maxOutputTokens(maxOutputTokens),scriptedOutputTokens(model.tokenizer(scriptedOutput)) {
     }
 std::size_t GenerativeRequest::getNeedToUnreserve() const{
     return reservedBlocks - memoryBlocks.size();
@@ -55,17 +55,17 @@ for (std::size_t i = 0; i < limit; ++i) {
 }
 return result;
 }
-std::size_t GenerativeRequest::getNeededMemory(const GPU& gpu) const{
-    return 0;
+std::size_t GenerativeRequest::getNeededMemory(const GPU& gpu) const{ // the real amount of cells memory the request need (considering the cached prefix)
+    return model.getEmbeddingSize() * (tokens.size() + maxOutputTokens - gpu.findLongestCachedPrefix(model.getId(), model.getEmbeddingSize(), tokens).matchedTokens);
 }
-std::size_t GenerativeRequest::getMaxNeededMemory() const{  // the maximum memory cells GPU has to allocate to this request.
-    return model.getEmbeddingSize() * (tokens.size() + maxOutputTokens); 
+std::size_t GenerativeRequest::getMaxNeededMemory() const{  // the maximum memory cells GPU has to allocate to this request (without the cached prefix)
+    return (model.getEmbeddingSize())*(tokens.size() + maxOutputTokens); 
 }
 std::vector<std::string> GenerativeRequest::getCacheableTokens() const{
     return tokens;
 }
 void GenerativeRequest::allocateOneBlock(GPU& gpu, std::size_t slot) const{
-    return;
+    memoryBlocks.push_back(slot);
 }
 Request* GenerativeRequest::clone(const Model& model) const{
     return new GenerativeRequest(id, model, admissionCycle, joinTokens(tokens), scriptedOutput, maxOutputTokens);
@@ -74,10 +74,20 @@ void GenerativeRequest::act(GPU& gpu){
     return;
 }
 bool GenerativeRequest::finished() const{
-    return true;
+    return generatedTokens.size == min(maxOutputTokens, scriptedOtputTokens.size());
+}
+}
 }
 void GenerativeRequest::reserveMemory(GPU& gpu){
-    return;
+    PrefixMatch cachedBlocks = gpu.findLongestCachedPrefix(model.getId(), model.getEmbeddingSize(), tokens);
+    // aquire the cached prefix blocks in the GPU for the request 
+    for(std::size_t i = 0; i < cachedBlocks.blockIds.size() ; i++){
+        gpu.acquire(cachedBlocks.blockIds[i]);
+        memoryBlocks.push_back(cachedBlocks.blockIds[i]);    
+    }
+    //reserve the blocks the request still need
+    std::size_t extraMeomory = getNeededMemory(gpu);
+    gpu.reserve((extraMeomory + gpu.getBlockSize() - 1) / gpu.getBlockSize(), *this);
 }
 
  
@@ -87,7 +97,7 @@ void GenerativeRequest::reserveMemory(GPU& gpu){
 // =================================================================
 
 EmbeddingRequest::EmbeddingRequest(int id, const Model& model, int admissionCycle, std::string prompt):
-    Request(id, model, admissionCycle, prompt), finalOutput("")  { 
+    Request(id, model, admissionCycle, prompt), ""  { 
 }
 std::size_t EmbeddingRequest ::getNeedToUnreserve() const{
     return reservedBlocks - memoryBlocks.size();
@@ -97,16 +107,16 @@ std::string EmbeddingRequest::getOutput() const override{
     return finalOutput;
 }
 std::size_t EmbeddingRequest::getNeededMemory(const GPU& gpu) const{
-    return 0;
+    return 2*model.getEmbeddingSize();
 }
-std::size_t EmbeddingRequest::getMaxNeededMemory() const{ //one vector to the current prompt token in embedding size, one vector to the running sum
+std::size_t EmbeddingRequest::getMaxNeededMemory() const{ //one vector to the current prompt token in embedding size, another one vector to the running sum
     return 2*model.getEmbeddingSize();
 }
 std::vector<std::string> EmbeddingRequest::getCacheableTokens() const{
     return std::vector<std::string>();
 }
 void EmbeddingRequest::allocateOneBlock(GPU& gpu, std::size_t slot) const{
-    return;
+    memoryBlocks.push_back(slot);
 }
 Request* EmbeddingRequest::clone(const Model& model) const{
     return new EmbeddingRequest(id, model, admissionCycle, joinTokens(tokens));
@@ -157,6 +167,17 @@ bool EmbeddingRequest::finished() const{
     return true;
 }
 void EmbeddingRequest::reserveMemory(GPU& gpu){
-    return;
+    // computing the number of blocks needed for the request
+    std::size_t neededMemory = getNeededMemory(gpu); // שזה 2 * embeddingSize
+    std::size_t blockSize = gpu.getBlockSize();
+    std::size_t numBlocks = (neededMemory + blockSize - 1) / blockSize;
+
+    // update the gpu of my request that this blocks from now on occupied by me
+    gpu.reserve(numBlocks, *this);
+
+    // allocate those blocks to my request
+    for (std::size_t i = 0; i < numBlocks; ++i) {
+        memoryBlocks.push_back(gpu.allocateBlock(*this));
+    }
 }
 

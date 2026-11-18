@@ -17,6 +17,9 @@ public:
     std::size_t getEmbeddingSize() const{
         return embeddingSize;
     }
+    std::string getId() const{
+        return modelId;
+    }
 private:
     std::string modelId;
     std::size_t embeddingSize;
