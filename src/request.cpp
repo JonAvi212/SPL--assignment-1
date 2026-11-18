@@ -3,14 +3,17 @@
 #include "Model.h"
 #include <string>   
 #include <vector>
+#include <algorithm>
 
 // =================================================================
 //                       Base Class: Request
 // =================================================================
 
 Request::Request(int id, const Model& model, int admissionCycle, std::string prompt):
-    id(id), model(model), admissionCycle(admissionCycle), tokens(tokenize(prompt)), reservedBlocks(0) {
-    }
+    id(id), model(model), admissionCycle(admissionCycle), tokens(model.tokenizer(prompt)),memoryBlocks(), reservedBlocks(0) {
+}
+Request::~Request() = default;
+
 int Request:: getId() const{
     return id;
 }
@@ -37,23 +40,20 @@ void Request::deallocateMemory(GPU& gpu){
 
 GenerativeRequest::GenerativeRequest(int id, const Model& model, int admissionCycle, std::string prompt, std::string scriptedOutput,
 std::size_t maxOutputTokens):
-    Request(id, model, admissionCycle, prompt), scriptedOutput(scriptedOutput), maxOutputTokens(maxOutputTokens),scriptedOutputTokens(model.tokenizer(scriptedOutput)) {
+    Request(id, model, admissionCycle, prompt), scriptedOutput(scriptedOutput),scriptedOutputTokens(model.tokenizer(scriptedOutput)),generatedTokens(), maxOutputTokens(maxOutputTokens), processedTokens(0),allocatedBlocks(0) {
     }
 std::size_t GenerativeRequest::getNeedToUnreserve() const{
-    return reservedBlocks - memoryBlocks.size();
+    return reservedBlocks - allocatedBlocks;
 }  
 std::string GenerativeRequest::getOutput() const{
-    //the desired output: The output of a generative request is its generated tokens joined by single spaces (the scriptedoutput, cut to maxOutputTokens tokens).
-    std::vector<std::string> tokens = model.tokenizer(scriptedOutput);
-    std::size_t limit = std::min(tokens.size(), maxOutputTokens);
     std::string result = "";
-for (std::size_t i = 0; i < limit; ++i) {
-    result += tokens[i];
-    if (i + 1 < limit) {
-        result += " ";
+    for (std::size_t i = 0; i < generatedTokens.size(); ++i) {
+        if (i > 0) {
+            result += " ";
+        }
+        result += generatedTokens[i];
     }
-}
-return result;
+    return result;
 }
 std::size_t GenerativeRequest::getNeededMemory(const GPU& gpu) const{ // the real amount of cells memory the request need (considering the cached prefix)
     return model.getEmbeddingSize() * (tokens.size() + maxOutputTokens - gpu.findLongestCachedPrefix(model.getId(), model.getEmbeddingSize(), tokens).matchedTokens);
@@ -65,29 +65,79 @@ std::vector<std::string> GenerativeRequest::getCacheableTokens() const{
     return tokens;
 }
 void GenerativeRequest::allocateOneBlock(GPU& gpu, std::size_t slot) const{
-    memoryBlocks.push_back(slot);
+    gpu.addMemoryBlock(*this, slot);
 }
-Request* GenerativeRequest::clone(const Model& model) const{
-    return new GenerativeRequest(id, model, admissionCycle, joinTokens(tokens), scriptedOutput, maxOutputTokens);
+Request* GenerativeRequest::clone(const Model& model) const {
+    GenerativeRequest* copy = new GenerativeRequest(id, model, admissionCycle, "", scriptedOutput, maxOutputTokens);
+    copy->tokens = tokens;
+    copy->reservedBlocks = reservedBlocks;
+    copy->memoryBlocks = memoryBlocks;
+    copy->generatedTokens = generatedTokens;
+    copy->processedTokens = processedTokens;
+    copy->allocatedBlocks = allocatedBlocks;
+    return copy;
 }
+
 void GenerativeRequest::act(GPU& gpu){
-    return;
+    if (finished()) {
+        return;
+    }
+
+    std::size_t embeddingSize = model.getEmbeddingSize();
+    std::size_t tokensPerBlock = gpu.getBlockSize() / embeddingSize;
+    std::size_t tokenIndexInBlock = processedTokens % tokensPerBlock;
+
+    // Allocate a new KV block only when starting a new block
+    if (tokenIndexInBlock == 0) {
+        memoryBlocks.push_back(gpu.allocateBlock(*this));
+        allocatedBlocks++;
+    }
+
+    // Build the full prefix up to and including the current token
+    std::vector<std::string> prefix;
+    if (processedTokens < tokens.size()) {
+        // Prefill phase: processing a prompt token
+        prefix.assign(tokens.begin(), tokens.begin() + processedTokens + 1);
+    } else {
+        // Decoding phase: generating the next scripted output token
+        std::size_t outputIdx = processedTokens - tokens.size();
+        generatedTokens.push_back(scriptedOutputTokens[outputIdx]);
+
+        prefix = tokens;
+        prefix.insert(prefix.end(), generatedTokens.begin(), generatedTokens.end());
+    }
+
+    // Write the KV vector of the current token into the current block at its offset
+    std::size_t currentSlot = memoryBlocks.back();
+    std::size_t offset = tokenIndexInBlock * embeddingSize;
+    model.generateTokenEmbedding(prefix, gpu, currentSlot, offset);
+
+    processedTokens++;
+
+    // Only full blocks get a prefix key for caching
+    if (processedTokens % tokensPerBlock == 0) {
+        gpu.assignPrefixToBlock(currentSlot, prefix, model.getId());
+    }
 }
 bool GenerativeRequest::finished() const{
-    return generatedTokens.size == min(maxOutputTokens, scriptedOtputTokens.size());
+    std::size_t totalTokens = tokens.size() + std::min(maxOutputTokens, scriptedOutputTokens.size());
+    return processedTokens == totalTokens;
 }
-}
-}
+
 void GenerativeRequest::reserveMemory(GPU& gpu){
     PrefixMatch cachedBlocks = gpu.findLongestCachedPrefix(model.getId(), model.getEmbeddingSize(), tokens);
-    // aquire the cached prefix blocks in the GPU for the request 
-    for(std::size_t i = 0; i < cachedBlocks.blockIds.size() ; i++){
+
+    // Acquire the cached prefix blocks and mark their tokens as already processed
+    for (std::size_t i = 0; i < cachedBlocks.blockIds.size(); ++i) {
         gpu.acquire(cachedBlocks.blockIds[i]);
-        memoryBlocks.push_back(cachedBlocks.blockIds[i]);    
+        memoryBlocks.push_back(cachedBlocks.blockIds[i]);
     }
-    //reserve the blocks the request still need
-    std::size_t extraMeomory = getNeededMemory(gpu);
-    gpu.reserve((extraMeomory + gpu.getBlockSize() - 1) / gpu.getBlockSize(), *this);
+    processedTokens = cachedBlocks.matchedTokens;
+
+    // Reserve the blocks still needed for remaining prompt tokens + maxOutputTokens
+    std::size_t numBlocks = gpu.getBlocksForMemory(model.getEmbeddingSize() * (tokens.size() - cachedBlocks.matchedTokens + maxOutputTokens));
+    gpu.reserve(numBlocks, *this);
+    reservedBlocks = numBlocks;
 }
 
  
@@ -97,12 +147,12 @@ void GenerativeRequest::reserveMemory(GPU& gpu){
 // =================================================================
 
 EmbeddingRequest::EmbeddingRequest(int id, const Model& model, int admissionCycle, std::string prompt):
-    Request(id, model, admissionCycle, prompt), ""  { 
+    Request(id, model, admissionCycle, prompt), finalOutput(""),processedTokensCount(0)  { 
 }
 std::size_t EmbeddingRequest ::getNeedToUnreserve() const{
     return reservedBlocks - memoryBlocks.size();
 }
-std::string EmbeddingRequest::getOutput() const override{
+std::string EmbeddingRequest::getOutput() const{
     //the desired output: The output of an embedding request is the mean of its token vectors which computed in the act func.
     return finalOutput;
 }
@@ -116,66 +166,69 @@ std::vector<std::string> EmbeddingRequest::getCacheableTokens() const{
     return std::vector<std::string>();
 }
 void EmbeddingRequest::allocateOneBlock(GPU& gpu, std::size_t slot) const{
-    memoryBlocks.push_back(slot);
+    gpu.addMemoryBlock(*this, slot);
 }
 Request* EmbeddingRequest::clone(const Model& model) const{
-    return new EmbeddingRequest(id, model, admissionCycle, joinTokens(tokens));
+    EmbeddingRequest* copy = new EmbeddingRequest(id, model, admissionCycle, "");
+    copy->tokens = tokens;
+    copy->reservedBlocks = reservedBlocks;
+    copy->memoryBlocks = memoryBlocks;
+    copy->processedTokensCount = processedTokensCount;
+    copy->finalOutput = finalOutput;
+    return copy;
 }
 void EmbeddingRequest::act(GPU& gpu){
-    // ... 
-    // [Your existing logic here: generating the current token's embedding 
-    // and adding it to the running sum stored at offset 0 of memoryBlocks[0]]
-    // ...
+    if (finished()) {
+        return;
+    }
+    std::size_t embeddingSize = model.getEmbeddingSize();
+    std::size_t firstBlockSlot = memoryBlocks[0];
+    // If 2 vectors fit in 1 block: current token starts at offset embeddingSize in memoryBlocks[0].
+    // If 1 vector per block (2 blocks): current token starts at offset 0 in memoryBlocks[1].
+    std::size_t currTokenSlot = (memoryBlocks.size() == 1) ? memoryBlocks[0] : memoryBlocks[1];
+    std::size_t currTokenOffset = (memoryBlocks.size() == 1) ? embeddingSize : 0;
 
-    // Increment your internal counter (assuming you have one)
+    // Generate embedding for the current token only
+    std::vector<std::string> currentToken(1, tokens[processedTokensCount]);
+    model.generateTokenEmbedding(currentToken, gpu, currTokenSlot, currTokenOffset);
+
+    // Add current token vector element-wise to the running sum at offset 0 of memoryBlocks[0]
+    for (std::size_t i = 0; i < embeddingSize; ++i) {
+        int runningSum = gpu.readFromBlock(firstBlockSlot, i);
+        int tokenVal = gpu.readFromBlock(currTokenSlot, currTokenOffset + i);
+        gpu.writeToBlock(firstBlockSlot, i, runningSum + tokenVal);
+    }
+
     processedTokensCount++;
 
-    // Check if this was the last token. If so, build and save the final output string.
+    // If this was the last token, compute the mean and build finalOutput
     if (processedTokensCount == tokens.size()) {
-        size_t numTokens = tokens.size();
-        if (numTokens == 0) numTokens = 1; // Edge case protection
+        int numTokens = static_cast<int>(tokens.size());
+        if (numTokens == 0) {
+            numTokens = 1;
+        }
 
         finalOutput = "[";
-        bool isFirstElement = true;
-
-        // The slot holding our running sum
-        size_t firstBlockSlot = memoryBlocks[0]; 
-
-        for (size_t i = 0; i < embeddingSize; ++i) {
-            // Read the accumulated sum for coordinate 'i' from the GPU.
-            // We assume the running sum is logically placed starting at offset 0.
+        for (std::size_t i = 0; i < embeddingSize; ++i) {
             int currentSum = gpu.readFromBlock(firstBlockSlot, i);
-            
-            // Calculate the average using integer division as required
             int averagedValue = currentSum / numTokens;
 
-            if (!isFirstElement) {
+            if (i > 0) {
                 finalOutput += ", ";
             }
             finalOutput += std::to_string(averagedValue);
-            isFirstElement = false;
         }
-
         finalOutput += "]";
-        
-        // Note: The request has now generated its output. 
-        // In the next server cycle, finished() should return true.
     }
 }
 
-bool EmbeddingRequest::finished() const{
-    return true;
+bool EmbeddingRequest::finished() const {
+    return processedTokensCount == tokens.size();
 }
 void EmbeddingRequest::reserveMemory(GPU& gpu){
-    // computing the number of blocks needed for the request
-    std::size_t neededMemory = getNeededMemory(gpu); // שזה 2 * embeddingSize
-    std::size_t blockSize = gpu.getBlockSize();
-    std::size_t numBlocks = (neededMemory + blockSize - 1) / blockSize;
-
-    // update the gpu of my request that this blocks from now on occupied by me
+    std::size_t numBlocks = gpu.getBlocksForMemory(getNeededMemory(gpu));
     gpu.reserve(numBlocks, *this);
-
-    // allocate those blocks to my request
+    reservedBlocks = numBlocks;
     for (std::size_t i = 0; i < numBlocks; ++i) {
         memoryBlocks.push_back(gpu.allocateBlock(*this));
     }
