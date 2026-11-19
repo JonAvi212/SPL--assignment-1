@@ -12,26 +12,35 @@ protected:
     int* data;
 public:
     MemoryBlock(size_t size);
+    
+    virtual ~MemoryBlock();
+    MemoryBlock(const MemoryBlock& other);
+    MemoryBlock& operator=(const MemoryBlock& other);
+    MemoryBlock(MemoryBlock&& other);
+    MemoryBlock& operator=(MemoryBlock&& other);
+
     virtual IdleAction onLastRelease() const = 0;
     virtual MemoryBlock* clone() const = 0;
     int readFromBlock(std::size_t offset) const;
     void writeToBlock(std::size_t offset, int value);
     void acquire();
     IdleAction release();
+
+    int getRefCount() const;
 };
 
 class KVBlock: public MemoryBlock{
 public:
     KVBlock(size_t size);
-    virtual IdleAction onLastRelease() const;
-    virtual MemoryBlock* clone() const;
+    IdleAction onLastRelease() const override;
+    MemoryBlock* clone() const override;
 };
 
 class EmbeddingWorkspace: public MemoryBlock{
 public:
     EmbeddingWorkspace(size_t size);
-    virtual IdleAction onLastRelease() const;
-    virtual MemoryBlock* clone() const;
+    IdleAction onLastRelease() const override;
+    MemoryBlock* clone() const override;
 };
 
 #endif
